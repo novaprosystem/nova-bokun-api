@@ -1,4 +1,4 @@
-// server.js (Node 18+ ESM)
+// server.js
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
@@ -7,77 +7,76 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-// ──────────────────────────────────────────────────────────────────────────────
-// ENV
-// ──────────────────────────────────────────────────────────────────────────────
+// ==== ENV ====
 const PORT = process.env.PORT || 8080;
-const API_BASE = (process.env.BOKUN_API_BASE || "https://api.bokun.io").replace(/\/+$/,'');
-const ACCESS_KEY = process.env.BOKUN_ACCESS_KEY || "";
-const SECRET_KEY = process.env.BOKUN_SECRET_KEY || "";
-const ACCESS_TOKEN = process.env.BOKUN_ACCESS_TOKEN || "";
-const VENDOR_ID  = process.env.BOKUN_VENDOR_ID || "";
+const API_BASE = process.env.BOKUN_API_BASE || "https://api.bokun.io";
+const ACCESS_KEY = process.env.BOKUN_ACCESS_KEY;  // clave de acceso
+const SECRET_KEY = process.env.BOKUN_SECRET_KEY;  // clave secreta
+const VENDOR_ID  = process.env.BOKUN_VENDOR_ID || ""; // opcional
 
-// Para depurar rápidamente en /api/health
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
-
-// Qué modo de auth usaremos
-const AUTH_MODE = ACCESS_TOKEN ? "token" : (ACCESS_KEY && SECRET_KEY ? "keypair" : "none");
-if (AUTH_MODE === "none") {
-  console.warn("⚠️  No se encontraron credenciales. Define BOKUN_ACCESS_TOKEN o (BOKUN_ACCESS_KEY + BOKUN_SECRET_KEY).");
+if (!ACCESS_KEY || !SECRET_KEY) {
+  console.error("❌ Falta BOKUN_ACCESS_KEY o BOKUN_SECRET_KEY en las variables de entorno.");
+  process.exit(1);
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// APP & CORS
-// ──────────────────────────────────────────────────────────────────────────────
+// ==== CORS ====
+// Dominios permitidos por ENV o defaults (incluye tu dominio nuevo)
+const defaultAllowed = [
+  "https://www.mynovaxperience.com",
+  "https://mynovaxperience.com",
+  "https://nova-experience.bokun.io",
+  "https://sitebuilder.bokun.tools"
+];
+
+const allowed = [
+  ...(process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean),
+  ...defaultAllowed
+].filter((v, i, a) => a.indexOf(v) === i); // únicos
+
 const app = express();
 
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // SSR / curl
-    cb(null, allowedOrigins.includes(origin));
+    // Permite server-to-server (sin origin)
+    if (!origin) return cb(null, true);
+    return cb(null, allowed.includes(origin));
   }
 }));
 
 app.use(express.json());
 app.use(morgan("tiny"));
 
-// ──────────────────────────────────────────────────────────────────────────────
-/** Crea cliente axios con el esquema de auth correcto.
- * He visto dos variantes en Bókun:
- * 1) Par de claves:   "Bokun-Access-Key" + "Bokun-Secret-Key"
- * 2) Token único:     "X-Bokun-Access-Token"  (algunos usan "Authorization: Bearer <token>")
- * Si tu doc dice otra cabecera exacta, cámbiala aquí.
- */
-function buildBokunClient() {
-  const headers = { "Content-Type": "application/json" };
-
-  if (AUTH_MODE === "keypair") {
-    headers["Bokun-Access-Key"] = ACCESS_KEY;
-    headers["Bokun-Secret-Key"] = SECRET_KEY;
-  } else if (AUTH_MODE === "token") {
-    // Intenta primero con cabecera dedicada…
-    headers["X-Bokun-Access-Token"] = ACCESS_TOKEN;
-    // …y de respaldo también como Bearer (algunas puertas de enlace lo exigen)
-    headers["Authorization"] = `Bearer ${ACCESS_TOKEN}`;
+// ==== Cliente axios con headers compatibles con Bókun ====
+const bokun = axios.create({
+  baseURL: API_BASE,
+  timeout: 15000,
+  headers: {
+    "Content-Type": "application/json"
   }
+});
 
-  return axios.create({
-    baseURL: API_BASE,
-    timeout: 15000,
-    headers,
-    // para ver todo en /api/debug cuando falle
-    validateStatus: () => true
-  });
-}
+// Interceptor para adjuntar TODOS los variantes de headers
+bokun.interceptors.request.use((config) => {
+  const h = config.headers ?? {};
 
-const bokun = buildBokunClient();
+  // Acceso
+  h["Bokun-Access-Key"]   = ACCESS_KEY;
+  h["X-Access-Key"]       = ACCESS_KEY;
+  h["X-Bokun-Access-Key"] = ACCESS_KEY;
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────────────────────────────────────
+  // Secreto
+  h["Bokun-Secret-Key"]   = SECRET_KEY;
+  h["X-Secret-Key"]       = SECRET_KEY;
+  h["X-Bokun-Secret-Key"] = SECRET_KEY;
+
+  config.headers = h;
+  return config;
+});
+
+// ==== Mapeo a payload limpio para las cards ====
 function mapActivity(a = {}) {
   const images = a.images || a.media || [];
   const cover  = images[0]?.url || images[0]?.originalUrl || null;
@@ -85,9 +84,9 @@ function mapActivity(a = {}) {
   const ratingValue = a.feedback?.averageRating ?? a.rating ?? null;
   const ratingCount = a.feedback?.count ?? a.reviewCount ?? null;
 
-  const pricing    = a.pricing || a.price || {};
-  const fromPrice  = pricing.fromPrice ?? pricing.amount ?? null;
-  const currency   = pricing.currency || pricing.currencyCode || "USD";
+  const pricing   = a.pricing || a.price || {};
+  const fromPrice = pricing.fromPrice ?? pricing.amount ?? null;
+  const currency  = pricing.currency ?? pricing.currencyCode ?? "USD";
 
   return {
     id: a.id || a.activityId,
@@ -104,91 +103,92 @@ function mapActivity(a = {}) {
   };
 }
 
-function sendBokunError(res, axiosResp) {
-  const status = axiosResp?.status || 500;
-  return res.status(status).json({
-    error: true,
-    status,
-    message: axiosResp?.data || axiosResp?.statusText || "Unknown error from Bokun"
-  });
-}
+// ==== Endpoints ====
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Health / Debug
-// ──────────────────────────────────────────────────────────────────────────────
+// Health
 app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    ts: Date.now(),
-    apiBase: API_BASE,
-    authMode: AUTH_MODE,
-    allowed: allowedOrigins
-  });
+  res.json({ ok: true, ts: Date.now(), allowed });
 });
 
-/** Pega contra el search tal cual y te devuelve TODO (headers+cuerpo) para depurar */
+// Debug: prueba directa al search
 app.get("/api/debug/search", async (req, res) => {
-  const body = {
-    page: Number(req.query.page || 1),
-    pageSize: Math.min(Number(req.query.pageSize || 6), 50),
-    ...(req.query.q ? { query: String(req.query.q) } : {}),
-    ...(VENDOR_ID ? { vendorId: VENDOR_ID } : {})
-  };
-
   try {
-    const r = await bokun.post("/activity.json/search", body);
-    res.status(r.status).json({
-      ok: r.status < 400,
-      headers: r.headers,
-      data:  r.data
+    const { data, headers, status } = await bokun.post("/activity.json/search", {
+      page: 1,
+      pageSize: 1
     });
-  } catch (e) {
-    res.status(500).json({ ok:false, error: String(e) });
+    res.json({ ok: true, status, headers, sample: data });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({
+      ok: false,
+      headers: err.response?.headers,
+      data: err.response?.data,
+      message: err.message,
+    });
   }
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
-// API PÚBLICA PARA LA WEB
-// ──────────────────────────────────────────────────────────────────────────────
+// Lista de tours
+// GET /api/tours?page=1&pageSize=20&query=lagoon
 app.get("/api/tours", async (req, res) => {
-  const page     = Number(req.query.page || 1);
-  const pageSize = Math.min(Number(req.query.pageSize || req.query.limit || 6), 50);
-  const query    = (req.query.query || req.query.q || "").toString();
+  try {
+    const page = Number(req.query.page || 1);
+    const pageSize = Math.min(Number(req.query.pageSize || req.query.limit || 20), 50);
+    const queryText = (req.query.query || "").toString();
 
-  const body = {
-    page,
-    pageSize,
-    ...(query ? { query } : {}),
-    ...(VENDOR_ID ? { vendorId: VENDOR_ID } : {})
-  };
+    const body = {
+      page,
+      pageSize,
+      ...(queryText ? { query: queryText } : {}),
+      ...(VENDOR_ID ? { vendorId: VENDOR_ID } : {})
+    };
 
-  const r = await bokun.post("/activity.json/search", body);
-  if (r.status >= 400) return sendBokunError(res, r);
+    const { data } = await bokun.post("/activity.json/search", body);
+    const itemsData = Array.isArray(data?.results || data?.items)
+      ? (data.results || data.items)
+      : [];
 
-  const list = Array.isArray(r.data?.results || r.data?.items)
-    ? (r.data.results || r.data.items).map(mapActivity)
-    : [];
+    const items = itemsData.map(mapActivity);
 
-  res.json({
-    page,
-    pageSize,
-    total: r.data?.total ?? list.length,
-    items: list
-  });
+    res.json({
+      page,
+      pageSize,
+      total: data?.total ?? items.length,
+      items
+    });
+  } catch (err) {
+    const code = err.response?.status || 500;
+    res.status(code).json({
+      error: true,
+      status: code,
+      message: err.response?.data || err.message
+    });
+  }
 });
 
+// Detalle por ID
+// GET /api/tours/:id
 app.get("/api/tours/:id", async (req, res) => {
-  const r = await bokun.get(`/activity.json/${encodeURIComponent(req.params.id)}`);
-  if (r.status >= 400) return sendBokunError(res, r);
-
-  res.json({
-    ...mapActivity(r.data),
-    raw: r.data
-  });
+  try {
+    const id = req.params.id;
+    const { data } = await bokun.get(`/activity.json/${id}`);
+    res.json({ ...mapActivity(data), raw: data });
+  } catch (err) {
+    const code = err.response?.status || 500;
+    res.status(code).json({
+      error: true,
+      status: code,
+      message: err.response?.data || err.message
+    });
+  }
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
+// Root
+app.get("/", (_req, res) => {
+  res.type("text").send("Nova Bokun API is running.");
+});
+
 app.listen(PORT, () => {
-  console.log(`✅ Nova Bokun API running on :${PORT}`);
-  console.log(`   Base: ${API_BASE} | Auth: ${AUTH_MODE}`);
+  console.log(`✅ Nova Bokun API on http://localhost:${PORT}`);
 });
+
