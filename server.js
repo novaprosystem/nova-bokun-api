@@ -1,68 +1,88 @@
-// server.js  —  Nova Xperience ↔︎ Bókun bridge (CommonJS)
+// server.js  — Nova Bokun API (CommonJS)
 
 const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
 const axios = require("axios");
 
-// ── ENV ────────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────
+// ENV
+// ────────────────────────────────────────────────────────────
 const PORT        = process.env.PORT || 8080;
 const API_BASE    = process.env.BOKUN_API_BASE || "https://api.bokun.io";
 const ACCESS_KEY  = process.env.BOKUN_ACCESS_KEY;
 const SECRET_KEY  = process.env.BOKUN_SECRET_KEY;
+const VENDOR_ID   = process.env.BOKUN_VENDOR_ID || ""; // opcional
 
-// Opcional si tu endpoint lo requiere (no suele hacer falta para /activity.json/*)
-const VENDOR_ID   = process.env.BOKUN_VENDOR_ID || "";
-
-// Validación rápida
 if (!ACCESS_KEY || !SECRET_KEY) {
-  console.error("❌ Falta BOKUN_ACCESS_KEY o BOKUN_SECRET_KEY en tus variables de entorno.");
+  console.error("❌ Falta BOKUN_ACCESS_KEY o BOKUN_SECRET_KEY en las variables de entorno.");
   process.exit(1);
 }
 
-// ── APP ────────────────────────────────────────────────────────────────────────
-const app = express();
+// Orígenes permitidos (ENV o defaults seguros)
+const defaultAllowed = [
+  "https://www.mynovaxperience.com",
+  "https://mynovaxperience.com",
+  "https://sitebuilder.bokun.tools",
+  "https://nova-experience.bokun.io",
+  "https://novaexperience.bokun.io"
+];
 
-// CORS: limita a tus sitios
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
 
-// Permite también llamadas server-to-server (sin Origin)
-app.use(cors({
+const ALLOWED = allowedOrigins.length ? allowedOrigins : defaultAllowed;
+
+// ────────────────────────────────────────────────────────────
+// App
+// ────────────────────────────────────────────────────────────
+const app = express();
+app.set("trust proxy", 1);
+
+// CORS sólido (incluye preflight)
+const corsHandler = cors({
   origin(origin, cb) {
+    // Permite server-to-server o curl (sin Origin)
     if (!origin) return cb(null, true);
-    if (allowedOrigins.includes(origin)) return cb(null, true);
+    if (ALLOWED.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS: " + origin));
-  }
-}));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true
+});
+app.use(corsHandler);
+app.options("*", corsHandler);
 
 app.use(express.json({ limit: "1mb" }));
 app.use(morgan("tiny"));
 
-// ── Cliente HTTP Bókun ────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────
+// Cliente Axios -> Bókun
+// ────────────────────────────────────────────────────────────
 const bokun = axios.create({
   baseURL: API_BASE,
   timeout: 15000,
   headers: {
+    "Content-Type": "application/json",
     "Bokun-Access-Key": ACCESS_KEY,
-    "Bokun-Secret-Key": SECRET_KEY,
-    "Content-Type": "application/json"
+    "Bokun-Secret-Key": SECRET_KEY
   }
 });
 
-// ── Util: mapeo a payload “limpio” para tus cards ─────────────────────────────
+// ────────────────────────────────────────────────────────────
 function mapActivity(a = {}) {
-  const images = a.images || a.media || [];
-  const cover  = images[0]?.url || images[0]?.originalUrl || null;
+  const imgs = a.images || a.media || [];
+  const cover = imgs[0]?.url || imgs[0]?.originalUrl || null;
 
   const ratingValue = a.feedback?.averageRating ?? a.rating ?? null;
   const ratingCount = a.feedback?.count ?? a.reviewCount ?? null;
 
   const pricing   = a.pricing || a.price || {};
   const fromPrice = pricing.fromPrice ?? pricing.amount ?? null;
-  const currency  = pricing.currency || pricing.currencyCode || "USD";
+  const currency  = pricing.currency ?? pricing.currencyCode ?? "USD";
 
   return {
     id: a.id || a.activityId,
@@ -75,40 +95,63 @@ function mapActivity(a = {}) {
     fromPrice,
     currency,
     duration: a.duration || a.durationText || null,
-    url: a.publicUrl || (a.slug ? `/tours/${a.slug}` : null)
+    url: a.publicUrl || (a.slug ? `/tours/${a.slug}` : null),
+
+    // por si quieres enlazar directamente a Bokun (si lo expone el payload):
+    // externalUrl: a.bookingUrl || null
   };
 }
 
-// ── Rutas API ──────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────
+// Endpoints
+// ────────────────────────────────────────────────────────────
 
-// Healthcheck + CORS info
+// Health + info útil para diagnóstico
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, ts: Date.now(), allowed: allowedOrigins });
+  res.json({ ok: true, ts: Date.now(), allowed: ALLOWED });
 });
 
-// Lista de tours (paginado/simple):
-// GET /api/tours?page=1&pageSize=20&query=text
+// Debug: hace un search mínimo a Bókun y devuelve raw (útil para probar keys)
+app.get("/api/debug/search", async (_req, res) => {
+  try {
+    const body = { page: 1, pageSize: 1, ...(VENDOR_ID ? { vendorId: VENDOR_ID } : {}) };
+    const r = await bokun.post("/activity.json/search", body);
+    res.json({ ok: true, headers: r.headers, data: r.data });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({
+      ok: false,
+      headers: err.response?.headers || {},
+      data: err.response?.data || { message: err.message }
+    });
+  }
+});
+
+// Lista de tours: GET /api/tours?page=1&pageSize=20&query=text
+// (alias: ?limit=N usa como pageSize)
 app.get("/api/tours", async (req, res) => {
   try {
-    const page     = Math.max(1, parseInt(req.query.page || "1", 10));
-    const pageSize = Math.min(50, Math.max(1, parseInt(req.query.pageSize || "20", 10)));
-    const query    = (req.query.query || "").toString().trim();
+    const page = Math.max(1, parseInt(req.query.page || "1", 10));
+    const limit = req.query.limit ? parseInt(req.query.limit, 10) : undefined;
+    const pageSize = Math.min(
+      parseInt(req.query.pageSize || (limit || 20), 10),
+      50
+    );
+    const queryText = (req.query.query || "").toString();
 
     const body = {
       page,
       pageSize,
-      ...(query ? { query } : {}),
+      ...(queryText ? { query: queryText } : {}),
       ...(VENDOR_ID ? { vendorId: VENDOR_ID } : {})
     };
 
-    // Bókun: POST /activity.json/search  (devuelve los productos)
     const { data } = await bokun.post("/activity.json/search", body);
 
-    const rawItems = Array.isArray(data?.results) ? data.results
-                    : Array.isArray(data?.items)   ? data.items
-                    : [];
+    const list = Array.isArray(data?.results || data?.items)
+      ? (data.results || data.items)
+      : [];
 
-    const items = rawItems.map(mapActivity);
+    const items = list.map(mapActivity);
 
     res.json({
       page,
@@ -117,51 +160,40 @@ app.get("/api/tours", async (req, res) => {
       items
     });
   } catch (err) {
-    const status = err.response?.status || 500;
-    res.status(status).json({
+    const code = err.response?.status || 500;
+    res.status(code).json({
       error: true,
-      status,
-      message: err.response?.data || err.message
+      status: code,
+      message: err.response?.data || { message: err.message }
     });
   }
 });
 
-// Detalle por ID:
-// GET /api/tours/:id
+// Detalle por ID: GET /api/tours/:id
 app.get("/api/tours/:id", async (req, res) => {
   try {
     const id = req.params.id;
-    // Bókun: GET /activity.json/{id}
-    const { data } = await bokun.get(`/activity.json/${encodeURIComponent(id)}`);
+    const { data } = await bokun.get(`/activity.json/${id}`);
     res.json({ ...mapActivity(data), raw: data });
   } catch (err) {
-    const status = err.response?.status || 500;
-    res.status(status).json({
+    const code = err.response?.status || 500;
+    res.status(code).json({
       error: true,
-      status,
-      message: err.response?.data || err.message
+      status: code,
+      message: err.response?.data || { message: err.message }
     });
   }
 });
 
-// Debug (para probar conectividad con Bókun desde el navegador):
-// GET /api/debug/search
-app.get("/api/debug/search", async (req, res) => {
-  try {
-    const { data, headers } = await bokun.post("/activity.json/search", { page: 1, pageSize: 1 });
-    res.json({ ok: true, headers, data });
-  } catch (err) {
-    const status = err.response?.status || 500;
-    res.status(status).json({
-      ok: false,
-      headers: err.response?.headers,
-      data: err.response?.data,
-      message: err.message
-    });
-  }
+// 404 claro para el resto
+app.use((req, res) => {
+  res.status(404).json({ error: true, message: "Not found" });
 });
 
-// ── Start ──────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────
+// Start
+// ────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`✅ Nova Bokun API running on http://localhost:${PORT}`);
+  console.log(`✅ Nova Bokun API listening on port ${PORT}`);
+  console.log(`   Allowed origins: ${ALLOWED.join(", ")}`);
 });
