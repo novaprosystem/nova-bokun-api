@@ -1,195 +1,203 @@
+// server.js  (ESM)
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
 import axios from "axios";
-import dotenv from "dotenv";
+import "dotenv/config";
 
-dotenv.config();
-
-// ---- ENV ----
-const PORT = process.env.PORT || 8080;
-const API_BASE = process.env.BOKUN_API_BASE || "https://api.bokun.io";
+// ────────────────────────────────────────────────────────────
+// ENV
+// ────────────────────────────────────────────────────────────
+const PORT       = process.env.PORT || 8080;
+const API_BASE   = process.env.BOKUN_API_BASE || "https://api.bokun.io";
 const ACCESS_KEY = process.env.BOKUN_ACCESS_KEY;
 const SECRET_KEY = process.env.BOKUN_SECRET_KEY;
 const VENDOR_ID  = process.env.BOKUN_VENDOR_ID || ""; // opcional
 
 if (!ACCESS_KEY || !SECRET_KEY) {
-  console.error("❌ Falta BOKUN_ACCESS_KEY o BOKUN_SECRET_KEY en el .env");
+  console.error("❌ Falta BOKUN_ACCESS_KEY o BOKUN_SECRET_KEY en las variables de entorno.");
   process.exit(1);
 }
 
+// ────────────────────────────────────────────────────────────
 const app = express();
 
-// ---- CORS (solo tus dominios) ----
+// CORS: solo orígenes permitidos (coma-separados)
 const allowed = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
 
 app.use(cors({
-  origin: function (origin, cb) {
-    // permite también peticiones server-to-server (sin origin)
-    if (!origin || allowed.includes(origin)) return cb(null, true);
-    cb(new Error("Not allowed by CORS: " + origin));
+  origin(origin, cb) {
+    // Permite server-to-server (sin origin)
+    if (!origin) return cb(null, true);
+    return cb(null, allowed.includes(origin));
   }
 }));
 
 app.use(express.json());
 app.use(morgan("tiny"));
 
-// ---- Cliente axios con headers de Bókun ----
+// ────────────────────────────────────────────────────────────
+// Cliente axios con headers de Bókun
+// (mandamos ambas variantes por compatibilidad)
+// ────────────────────────────────────────────────────────────
 const bokun = axios.create({
   baseURL: API_BASE,
-  timeout: 15000,
+  timeout: 20000,
   headers: {
-    // En Bókun, normalmente:
-    // Bokun-Access-Key y Bokun-Secret-Key (según docs compartidas)
+    // Variante 1 (prefijo X-)
+    "X-Bokun-AccessKey": ACCESS_KEY,
+    "X-Bokun-SecretKey": SECRET_KEY,
+    // Variante 2 (sin prefijo) – algunas cuentas esperan esto
     "Bokun-Access-Key": ACCESS_KEY,
     "Bokun-Secret-Key": SECRET_KEY,
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "Accept": "application/json"
   }
 });
 
-// ---- Utils: mapear actividad a un payload “limpio” para tus cards ----
+// ────────────────────────────────────────────────────────────
+// Normalizador para tus cards (defensivo ante distintos payloads)
+// ────────────────────────────────────────────────────────────
 function mapActivity(a = {}) {
-  const images = a.images || a.media || [];
-  const cover  = images[0]?.url || images[0]?.originalUrl || null;
+  const images =
+    a.images ||
+    a.media?.images ||
+    a.media ||
+    [];
 
-  const ratingValue = a.feedback?.averageRating || a.rating || null;
-  const ratingCount = a.feedback?.count || a.reviewCount || null;
+  const cover =
+    a.coverImage?.url ||
+    images[0]?.url ||
+    images[0]?.originalUrl ||
+    null;
 
-  const pricing = a.pricing || a.price || {};
-  const fromPrice = pricing.fromPrice || pricing.amount || null;
-  const currency  = pricing.currency || pricing.currencyCode || "USD";
+  const ratingValue =
+    a.feedback?.averageRating ||
+    a.rating ||
+    null;
+
+  const ratingCount =
+    a.feedback?.count ||
+    a.reviewCount ||
+    null;
+
+  // precios
+  const priceFrom =
+    a.priceFrom?.amount ??
+    a.fromPrice?.amount ??
+    a.lowestPrice?.amount ??
+    a.price?.amount ??
+    a.pricing?.fromPrice ??
+    null;
+
+  const currency =
+    a.priceFrom?.currency ??
+    a.fromPrice?.currency ??
+    a.lowestPrice?.currency ??
+    a.price?.currency ??
+    a.pricing?.currency ??
+    "USD";
+
+  const id =
+    a.id ?? a.activityId ?? a.productId ?? a.bokunId;
+
+  const title =
+    a.title ?? a.name ?? a.activityName ?? "Untitled";
+
+  const slug = a.slug || null;
+
+  // URL pública en tu sitio (ajústala a tu routing real si quieres)
+  const url = a.publicUrl || (slug ? `/tours/${slug}` : `/tours/${id}`);
 
   return {
-    id: a.id || a.activityId,
-    title: a.title || a.name,
+    id,
+    title,
     subtitle: a.subtitle || a.tagline || null,
-    slug: a.slug || null,
+    slug,
     cover,
     rating: ratingValue,
     ratingCount,
-    fromPrice,
+    fromPrice: priceFrom,
     currency,
     duration: a.duration || a.durationText || null,
-    // Para construir URL en tu sitio:
-    url: a.publicUrl || (a.slug ? `/tours/${a.slug}` : null)
+    url
   };
 }
 
-// ---- Endpoint: lista de tours (paginado) ----
-// GET /tours?page=1&pageSize=20&query=text
-app.get("/tours", async (req, res) => {
-  try {
-    const page = Number(req.query.page || 1);
-    const pageSize = Math.min(Number(req.query.pageSize || 20), 50);
-    const queryText = (req.query.query || "").toString();
+// ────────────────────────────────────────────────────────────
+// Healthcheck
+// ────────────────────────────────────────────────────────────
+app.get("/api/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-    // Cuerpo para /activity.json/search
+// ────────────────────────────────────────────────────────────
+// Lista de tours (para las cards)
+// GET /api/tours?limit=6&page=1&query=text
+// ────────────────────────────────────────────────────────────
+app.get("/api/tours", async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(50, Number(req.query.limit) || Number(req.query.pageSize) || 6));
+    const page  = Math.max(1, Number(req.query.page) || 1);
+    const queryText = (req.query.query || "").toString().trim();
+
     const body = {
       page,
-      pageSize,
+      pageSize: limit,
       ...(queryText ? { query: queryText } : {}),
       ...(VENDOR_ID ? { vendorId: VENDOR_ID } : {})
     };
 
+    // Bókun: POST /activity.json/search
     const { data } = await bokun.post("/activity.json/search", body);
 
-    const items = Array.isArray(data?.results || data?.items)
-      ? (data.results || data.items).map(mapActivity)
-      : [];
+    const rawItems = Array.isArray(data?.results) ? data.results
+                    : Array.isArray(data?.items)   ? data.items
+                    : Array.isArray(data)           ? data
+                    : [];
+
+    const items = rawItems.map(mapActivity);
 
     res.json({
       page,
-      pageSize,
-      total: data?.total || items.length,
+      pageSize: limit,
+      total: data?.total ?? items.length,
       items
     });
   } catch (err) {
     const code = err.response?.status || 500;
-    res.status(code).json({
-      error: true,
-      status: code,
-      message: err.response?.data || err.message
-    });
+    const msg  = typeof err.response?.data === "string" ? err.response.data : err.message;
+    console.error("BOKUN_LIST_ERROR:", msg);
+    res.status(code).json({ error: true, status: code, message: msg });
   }
 });
 
-// ---- Endpoint: detalle por ID ----
-// GET /tours/:id
-app.get("/tours/:id", async (req, res) => {
+// ────────────────────────────────────────────────────────────
+/**
+ * Detalle de un tour por ID
+ * GET /api/tours/:id
+ */
+// ────────────────────────────────────────────────────────────
+app.get("/api/tours/:id", async (req, res) => {
   try {
     const id = req.params.id;
+    // Bókun: GET /activity.json/{id}
     const { data } = await bokun.get(`/activity.json/${id}`);
 
     res.json({
       ...mapActivity(data),
-      raw: data // si necesitas más campos, vienen aquí
+      raw: data
     });
   } catch (err) {
     const code = err.response?.status || 500;
-    res.status(code).json({
-      error: true,
-      status: code,
-      message: err.response?.data || err.message
-    });
+    const msg  = typeof err.response?.data === "string" ? err.response.data : err.message;
+    console.error("BOKUN_DETAIL_ERROR:", msg);
+    res.status(code).json({ error: true, status: code, message: msg });
   }
 });
 
-// ---- Healthcheck ----
-app.get("/health", (_, res) => res.json({ ok: true }));
-
-app.listen(PORT, () =>
-  console.log(`✅ Nova Bokun API running on http://localhost:${PORT}`)
-);
-const express = require('express');
-const cors = require('cors');
-
-const app = express();
-
-// Lee orígenes permitidos desde la env var de Render
-const allowed = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-// CORS elegante: permite editor Bokun y tu dominio público
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // curl / server-side
-    return cb(null, allowed.includes(origin));
-  }
-}));
-
-// Health para “despertar” Render y probar rápido
-app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
-
-// ...tus rutas existentes, por ejemplo:
-// app.get('/api/tours', async (req, res) => { ... });
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log('API up on', PORT));
-import express from 'express';
-import cors from 'cors';
-
-const app = express();
-
-const allowed = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    return cb(null, allowed.includes(origin));
-  }
-}));
-
-app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
-
-// ...tus rutas /api/tours aquí...
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log('API up on', PORT));
+// ────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`✅ Nova Bokun API running on port ${PORT}`);
+});
