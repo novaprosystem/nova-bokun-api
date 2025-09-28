@@ -143,3 +143,30 @@ app.get("/health", (_, res) => res.json({ ok: true }));
 app.listen(PORT, () =>
   console.log(`✅ Nova Bokun API running on http://localhost:${PORT}`)
 );
+const express = require('express');
+const cors = require('cors');
+
+const app = express();
+
+// Lee orígenes permitidos desde la env var de Render
+const allowed = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// CORS elegante: permite editor Bokun y tu dominio público
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // curl / server-side
+    return cb(null, allowed.includes(origin));
+  }
+}));
+
+// Health para “despertar” Render y probar rápido
+app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// ...tus rutas existentes, por ejemplo:
+// app.get('/api/tours', async (req, res) => { ... });
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log('API up on', PORT));
