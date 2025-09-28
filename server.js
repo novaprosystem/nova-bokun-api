@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
@@ -10,22 +9,21 @@ dotenv.config();
 // ==== ENV ====
 const PORT = process.env.PORT || 8080;
 const API_BASE = process.env.BOKUN_API_BASE || "https://api.bokun.io";
-const ACCESS_KEY = process.env.BOKUN_ACCESS_KEY;  // clave de acceso
-const SECRET_KEY = process.env.BOKUN_SECRET_KEY;  // clave secreta
-const VENDOR_ID  = process.env.BOKUN_VENDOR_ID || ""; // opcional
+const ACCESS_KEY = process.env.BOKUN_ACCESS_KEY;
+const SECRET_KEY = process.env.BOKUN_SECRET_KEY;
+const VENDOR_ID  = process.env.BOKUN_VENDOR_ID || "";
 
 if (!ACCESS_KEY || !SECRET_KEY) {
-  console.error("❌ Falta BOKUN_ACCESS_KEY o BOKUN_SECRET_KEY en las variables de entorno.");
+  console.error("❌ Falta BOKUN_ACCESS_KEY o BOKUN_SECRET_KEY.");
   process.exit(1);
 }
 
 // ==== CORS ====
-// Dominios permitidos por ENV o defaults (incluye tu dominio nuevo)
 const defaultAllowed = [
   "https://www.mynovaxperience.com",
   "https://mynovaxperience.com",
   "https://nova-experience.bokun.io",
-  "https://sitebuilder.bokun.tools"
+  "https://sitebuilder.bokun.tools",
 ];
 
 const allowed = [
@@ -34,49 +32,56 @@ const allowed = [
     .map(s => s.trim())
     .filter(Boolean),
   ...defaultAllowed
-].filter((v, i, a) => a.indexOf(v) === i); // únicos
+].filter((v, i, a) => a.indexOf(v) === i);
 
 const app = express();
 
 app.use(cors({
   origin(origin, cb) {
-    // Permite server-to-server (sin origin)
     if (!origin) return cb(null, true);
-    return cb(null, allowed.includes(origin));
+    cb(null, allowed.includes(origin));
   }
 }));
-
 app.use(express.json());
 app.use(morgan("tiny"));
 
-// ==== Cliente axios con headers compatibles con Bókun ====
+// ==== Cliente axios ====
 const bokun = axios.create({
   baseURL: API_BASE,
   timeout: 15000,
-  headers: {
-    "Content-Type": "application/json"
-  }
+  headers: { "Content-Type": "application/json" }
 });
 
-// Interceptor para adjuntar TODOS los variantes de headers
+// 👉 Interceptor: setea TODAS las variantes de headers que Bókun suele aceptar
 bokun.interceptors.request.use((config) => {
   const h = config.headers ?? {};
 
+  const k = ACCESS_KEY;
+  const s = SECRET_KEY;
+
   // Acceso
-  h["Bokun-Access-Key"]   = ACCESS_KEY;
-  h["X-Access-Key"]       = ACCESS_KEY;
-  h["X-Bokun-Access-Key"] = ACCESS_KEY;
+  h["Bokun-Access-Key"]      = k;
+  h["X-Bokun-Access-Key"]    = k;
+  h["X-Access-Key"]          = k;
+  h["X-API-KEY"]             = k;
+  h["X-Api-Key"]             = k;
+  h["X-Booking-API-Key"]     = k;
+  h["X-Booking-Api-Key"]     = k;
 
   // Secreto
-  h["Bokun-Secret-Key"]   = SECRET_KEY;
-  h["X-Secret-Key"]       = SECRET_KEY;
-  h["X-Bokun-Secret-Key"] = SECRET_KEY;
+  h["Bokun-Secret-Key"]      = s;
+  h["X-Bokun-Secret-Key"]    = s;
+  h["X-Secret-Key"]          = s;
+  h["X-API-SECRET"]          = s;
+  h["X-Api-Secret"]          = s;
+  h["X-Booking-API-Secret"]  = s;
+  h["X-Booking-Api-Secret"]  = s;
 
   config.headers = h;
   return config;
 });
 
-// ==== Mapeo a payload limpio para las cards ====
+// ==== Utils ====
 function mapActivity(a = {}) {
   const images = a.images || a.media || [];
   const cover  = images[0]?.url || images[0]?.originalUrl || null;
@@ -104,32 +109,29 @@ function mapActivity(a = {}) {
 }
 
 // ==== Endpoints ====
-
-// Health
-app.get("/api/health", (req, res) => {
+app.get("/api/health", (_req, res) => {
   res.json({ ok: true, ts: Date.now(), allowed });
 });
 
-// Debug: prueba directa al search
-app.get("/api/debug/search", async (req, res) => {
+// Para probar claves/headers contra Bókun
+app.get("/api/debug/search", async (_req, res) => {
   try {
     const { data, headers, status } = await bokun.post("/activity.json/search", {
-      page: 1,
-      pageSize: 1
+      page: 1, pageSize: 1
     });
-    res.json({ ok: true, status, headers, sample: data });
+    res.json({ ok: true, status, sample: data, headers });
   } catch (err) {
     res.status(err.response?.status || 500).json({
       ok: false,
+      status: err.response?.status,
       headers: err.response?.headers,
       data: err.response?.data,
-      message: err.message,
+      message: err.message
     });
   }
 });
 
 // Lista de tours
-// GET /api/tours?page=1&pageSize=20&query=lagoon
 app.get("/api/tours", async (req, res) => {
   try {
     const page = Number(req.query.page || 1);
@@ -144,15 +146,12 @@ app.get("/api/tours", async (req, res) => {
     };
 
     const { data } = await bokun.post("/activity.json/search", body);
-    const itemsData = Array.isArray(data?.results || data?.items)
-      ? (data.results || data.items)
+    const items = Array.isArray(data?.results || data?.items)
+      ? (data.results || data.items).map(mapActivity)
       : [];
 
-    const items = itemsData.map(mapActivity);
-
     res.json({
-      page,
-      pageSize,
+      page, pageSize,
       total: data?.total ?? items.length,
       items
     });
@@ -166,12 +165,10 @@ app.get("/api/tours", async (req, res) => {
   }
 });
 
-// Detalle por ID
-// GET /api/tours/:id
+// Detalle
 app.get("/api/tours/:id", async (req, res) => {
   try {
-    const id = req.params.id;
-    const { data } = await bokun.get(`/activity.json/${id}`);
+    const { data } = await bokun.get(`/activity.json/${req.params.id}`);
     res.json({ ...mapActivity(data), raw: data });
   } catch (err) {
     const code = err.response?.status || 500;
@@ -183,12 +180,6 @@ app.get("/api/tours/:id", async (req, res) => {
   }
 });
 
-// Root
-app.get("/", (_req, res) => {
-  res.type("text").send("Nova Bokun API is running.");
-});
-
-app.listen(PORT, () => {
-  console.log(`✅ Nova Bokun API on http://localhost:${PORT}`);
-});
+app.get("/", (_req, res) => res.type("text").send("Nova Bokun API is running."));
+app.listen(PORT, () => console.log(`✅ Nova Bokun API on http://localhost:${PORT}`));
 
