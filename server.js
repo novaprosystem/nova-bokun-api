@@ -143,31 +143,3 @@ app.get("/health", (_, res) => res.json({ ok: true }));
 app.listen(PORT, () =>
   console.log(`✅ Nova Bokun API running on http://localhost:${PORT}`)
 );
-
-require('dotenv').config();
-const express = require('express');
-const fetch = require('node-fetch');
-const app = express();
-
-app.get('/tours', async (req, res) => {
-  try {
-    const response = await fetch(`${process.env.BOKUN_API_BASE}/activity.json/search`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Bokun-AccessKeyId': process.env.BOKUN_ACCESS_KEY,
-        'X-Bokun-SecretAccessKey': process.env.BOKUN_SECRET_KEY,
-      },
-      body: JSON.stringify({ page: 1, pageSize: 20 })
-    });
-
-    const data = await response.json();
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.listen(process.env.PORT, () => {
-  console.log(`Server running on port ${process.env.PORT}`);
-});
