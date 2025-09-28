@@ -170,3 +170,26 @@ app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log('API up on', PORT));
+import express from 'express';
+import cors from 'cors';
+
+const app = express();
+
+const allowed = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    return cb(null, allowed.includes(origin));
+  }
+}));
+
+app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// ...tus rutas /api/tours aquí...
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log('API up on', PORT));
